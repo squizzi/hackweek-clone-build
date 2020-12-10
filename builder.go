@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 
@@ -75,12 +74,11 @@ func main() {
 	if err != nil {
 		logrus.Fatalf("Failed to initialize buildkit client: %s", err)
 	}
-	_, wPipe := io.Pipe()
 
 	// - Resolve solveOpts
 	buildCtx := directory
 	imageName := fmt.Sprintf("%s-%s", pushLocation, gitHash[:7])
-	solveOpts, err := newSolveOpts(buildCtx, imageName, wPipe)
+	solveOpts, err := newSolveOpts(buildCtx, imageName)
 	if err != nil {
 		logrus.Fatalf("Failed to construct new solve opts for buildkit build: %s", err)
 	}
@@ -107,7 +105,7 @@ func main() {
 	}
 }
 
-func newSolveOpts(buildCtx, imageName string, w io.WriteCloser) (*client.SolveOpt, error) {
+func newSolveOpts(buildCtx, imageName string) (*client.SolveOpt, error) {
 	attachable := []session.Attachable{authprovider.NewDockerAuthProvider(os.Stderr)}
 	file := filepath.Join(buildCtx, "Dockerfile")
 	localDirs := map[string]string{
