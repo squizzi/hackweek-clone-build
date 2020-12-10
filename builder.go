@@ -4,20 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 
-	"github.com/containerd/console"
 	git "github.com/go-git/go-git"
 	"github.com/go-git/go-git/plumbing/transport/http"
 	"github.com/moby/buildkit/client"
-	dockerbuild "github.com/moby/buildkit/frontend/dockerfile/builder"
-	"github.com/moby/buildkit/util/progress/progressui"
+	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/session/auth/authprovider"
+	"github.com/moby/buildkit/util/progress/progresswriter"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
 func main() {
-	ctx := context.Background()
+	ctx := context.TODO()
 
 	// Get the job details from the loaded env vars when the job was submitted
 	pushLocation := os.Args[1]
@@ -65,7 +67,7 @@ func main() {
 	if err != nil {
 		logrus.Fatalf("Failed to construct git tag ref for pushed tag result: %s", err)
 	}
-	gitHash := ref.Hash()
+	gitHash := ref.Hash().String()
 
 	// Build
 	// - Get a buildkit client
@@ -73,43 +75,64 @@ func main() {
 	if err != nil {
 		logrus.Fatalf("Failed to initialize buildkit client: %s", err)
 	}
+	_, wPipe := io.Pipe()
 
+	// - Resolve solveOpts
 	buildCtx := directory
-	imageName := fmt.Sprintf("%s-%s", pushLocation, gitHash)
-	buildOpt := client.SolveOpt{
+	imageName := fmt.Sprintf("%s-%s", pushLocation, gitHash[:7])
+	solveOpts, err := newSolveOpts(buildCtx, imageName, wPipe)
+	if err != nil {
+		logrus.Fatalf("Failed to construct new solve opts for buildkit build: %s", err)
+	}
+
+	// - Conduct the build
+	pw, err := progresswriter.NewPrinter(context.TODO(), os.Stderr, "auto")
+	if err != nil {
+		logrus.Warnf("Failed to setup progresswriter, continuing build anyway: %s", err)
+	}
+	eg, ctx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		_, err = c.Solve(ctx, nil, *solveOpts, pw.Status())
+		return err
+	})
+	eg.Go(func() error {
+		<-pw.Done()
+		return pw.Err()
+	})
+	err = eg.Wait()
+	if err != nil {
+		logrus.Fatalf("Failed to build and push image: %s with buildkit: %s", imageName, err)
+	} else {
+		os.Exit(0)
+	}
+}
+
+func newSolveOpts(buildCtx, imageName string, w io.WriteCloser) (*client.SolveOpt, error) {
+	attachable := []session.Attachable{authprovider.NewDockerAuthProvider(os.Stderr)}
+	file := filepath.Join(buildCtx, "Dockerfile")
+	localDirs := map[string]string{
+		"context":    buildCtx,
+		"dockerfile": filepath.Dir(file),
+	}
+
+	frontend := "gateway.v0"
+	frontendAttrs := map[string]string{
+		"filename": filepath.Base(file),
+		"source":   "docker/dockerfile",
+	}
+	return &client.SolveOpt{
 		Exports: []client.ExportEntry{
 			{
 				Type: "image",
 				Attrs: map[string]string{
-					"name":           imageName,
-					"push":           "true",
-					"push-by-digest": "false",
+					"name": imageName,
+					"push": "true",
 				},
 			},
 		},
-		LocalDirs: map[string]string{
-			"context":    buildCtx,
-			"dockerfile": directory,
-		},
-		Frontend: "",
-		FrontendAttrs: map[string]string{
-			"filename": "Dockerfile",
-		},
-	}
-
-	// - Conduct the build using cloned source
-	solveCh := make(chan *client.SolveStatus)
-	eg, ctx := errgroup.WithContext(ctx)
-	eg.Go(func() error {
-		_, err = c.Build(ctx, buildOpt, "", dockerbuild.Build, solveCh)
-		return err
-	})
-	eg.Go(func() error {
-		c, _ := console.ConsoleFromFile(os.Stderr)
-		return progressui.DisplaySolveStatus(context.TODO(), "", c, os.Stdout, solveCh)
-	})
-	if err = eg.Wait(); err != nil {
-		logrus.Fatalf("Failed to build and push image: %s with buildkit: %s", imageName, err)
-		os.Exit(1)
-	}
+		Session:       attachable,
+		LocalDirs:     localDirs,
+		Frontend:      frontend,
+		FrontendAttrs: frontendAttrs,
+	}, nil
 }
